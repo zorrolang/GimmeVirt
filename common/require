@@ -1,0 +1,45 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+. ./common/install
+
+_set_cmd_prog()
+{
+	local name=$1
+	local capname=${name^^}
+	capname=${capname//-/_}
+
+	eval ${capname}_PROG=$(type -P $name)
+
+	if [ ! -x "$(eval echo \${${capname}_PROG})" ];then
+		unset ${capname}_PROG
+		return 1
+	fi
+	return 0
+}
+
+_notrun()
+{
+	echo "$*"
+	exit 0
+}
+
+# _require_progs cmdA cmdB ...
+#
+# You'll get CMD_PROG=$(type -P $cmd) if it returns
+# Or exit 0
+_require_progs()
+{
+	for cmd in "$@";do
+		_set_cmd_prog $cmd || _notrun "Miss $cmd command!"
+	done
+}
+
+# Require root permission
+_require_root_permission()
+{
+	if [ "$EUID" -ne 0 ];then
+		_notrun "Permission not enough! Please run with root or sudo"
+	fi
+}

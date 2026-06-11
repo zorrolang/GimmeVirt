@@ -1,0 +1,70 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+_virt_list()
+{
+	if [ -n "$*" ];then
+		$VIRSH_PROG list "$@"
+	else
+		$VIRSH_PROG list --all
+	fi
+}
+
+_is_virt_running()
+{
+	local vname="$1"
+
+	grep -q -x "$vname" < <(_virt_list --name --state-running)
+}
+
+_is_virt_inactive()
+{
+	local vname="$1"
+
+	grep -q -x "$vname" < <(_virt_list --name --inactive)
+}
+
+_is_virt_exist()
+{
+	local vname="$1"
+
+	grep -q -x "$vname" < <(_virt_list --name --all)
+}
+
+_create_virt_img()
+{
+	local fmt=$1
+	local img=$2
+	local size=$3
+
+	$QEMU_IMG_PROG create -f $fmt $img $size
+}
+
+_virt_start()
+{
+	$VIRSH_PROG start "$@"
+}
+
+_virt_shutdown()
+{
+	$VIRSH_PROG shutdown "$@"
+}
+
+_virt_destroy()
+{
+	$VIRSH_PROG destroy "$@"
+}
+
+_virt_force_cleanup()
+{
+	local name="$1"
+	local dir="$2"
+
+	_virt_destroy $name
+	$VIRSH_PROG undefine $name --remove-all-storage
+
+	if [ -d "$dir" ];then
+		rm -rf $dir
+	fi
+}

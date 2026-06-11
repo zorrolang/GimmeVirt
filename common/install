@@ -1,0 +1,129 @@
+## /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+# If there's dnf command, means yum has been instead by dnf. But there's a
+# difference between yum and dnf. yum ignores nomatch packages but dnf
+# doesn't. Refer to bug 1566355. So dnf need "--setopt=strict=0" option to
+# help itself to keep coincident with 'old' yum command before RHEL-8.
+if [ -z "$YUM_PROG" ];then
+	if command -v dnf >/dev/null;then
+		export YUM_PROG="$(type -P dnf) --setopt=strict=0"
+	else
+		export YUM_PROG=$(type -P yum)
+	fi
+fi
+
+_yum_install()
+{
+	$YUM_PROG install -y --nogpgcheck "$@"
+}
+
+export RPM_OSTREE_PROG=$(type -P rpm-ostree)
+# _ostree_install <package> [pakcages ...]
+# You can set RPM_OSTREE_OPTS to change the default install options.
+_ostree_install()
+{
+	local ret=0
+
+	[ -z "$RPM_OSTREE_OPTS" ] && \
+		RPM_OSTREE_OPTS="-A --idempotent --allow-inactive --assumeyes"
+
+	if [ ! -f "$RPM_OSTREE_PROG" ];then
+		echo "No rpm-ostree command!!"
+		return 1
+	fi
+
+	$RPM_OSTREE_PROG $RPM_OSTREE_OPTS install "$@"
+	ret=$?
+
+	# rpm-ostree can't ignore the "not found" packages automatically, so if
+	# above installation fails, try to install each package one by one
+	if [ $ret -ne 0 ];then
+		ret=0
+		for pkg in "$@";do
+			$RPM_OSTREE_PROG $RPM_OSTREE_OPTS install $pkg
+			if [ $? -ne 0 ];then
+				echo "rpm-ostree: Not found $pkg!"
+				((ret++))
+			fi
+		done
+	fi
+
+	return $ret
+}
+
+_try_install()
+{
+	if _is_rpm_ostree; then
+		_ostree_install "$@"
+		return $?
+	else
+		if ($YUM_PROG --help >/dev/null 2>&1);then
+			_yum_install "$@"
+			return $?
+		fi
+	fi
+
+	return 1
+}
+
+# _download <link> [path_to_filename]
+#
+# Automates file downloading by dynamically detecting and using available
+# CLI tools based on priority: aria2c -> wget -> curl.
+
+# <link> is required. The target URL to download.
+# <path_to_filename> is optional. The local save destination (e.g.
+#     /path/to/file, ./dir/file, or just a filename). If omitted,
+#     the tool decides the filename and saves it to the current
+#     working directory.
+_download()
+{
+	local link="$1"
+	local path="$2"
+	local opt=()
+	local ret=0
+
+	if [ -n "$(type -P aria2c)" ];then
+		if [ -n "$path" ];then
+			local dir=$(dirname $path)
+			local file=$(basename $path)
+			opt=(-d "$dir" -o "$file")
+		fi
+		aria2c -s 16 -x 16 "$link" "${opt[@]}"
+		ret=$?
+	elif [ -n "$(type -P curl)" ];then
+		if [ -n "$path" ];then
+			opt=(--create-dirs -o "$path")
+		fi
+		curl -fL "${opt[@]}" "$link"
+		ret=$?
+	elif [ -n "$(type -P wget)" ]; then
+		if [ -n "$path" ]; then
+			opt=(-O "$path")
+		fi
+		wget --force-directories --content-disposition "${opt[@]}" "$link"
+		ret=$?
+	else
+		echo "No proper command to download $link"
+		ret=1
+	fi
+	return $ret
+}
+
+_install_cockpit()
+{
+	_try_install cockpit cockpit-machines
+	systemctl enable --now cockpit.socket
+	if [ $? -ne 0 ]; then
+		echo "Fail to enable cockpit.socket"
+		return 1
+	fi
+
+	# Make sure firewall won't block cockpit
+	if systemctl is-active --quiet firewalld; then
+		firewall-cmd --permanent --add-service=cockpit
+		firewall-cmd --reload
+	fi
+}

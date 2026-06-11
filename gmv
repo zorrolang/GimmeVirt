@@ -1,0 +1,404 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+. ./common/rc
+. ./common/install
+. ./common/require
+. ./common/virt
+
+here=`pwd`
+tmp=/tmp/$$
+
+IMAGE_ROOT="/var/lib/libvirt/images"
+IMAGE_DIR=""
+IMAGE_FILE_SRC=""
+VIRT_TEMPLATE="default"
+VIRT_NAME=""
+VIRT_INSTALL_ARGS=()
+MEMORY_SIZE=8192
+CPU_CNT=4
+WORK_MODE="new"
+
+trap "cleanup;exit 0" EXIT HUP INT QUIT TERM
+cleanup()
+{
+	cd $here
+	rm -rf $tmp.*
+}
+
+download_fedora_rawhide()
+{
+	local base="${FED_RAW_CLOUD_x86}"
+	local name="$($CURL_PROG -s ${base} | \
+		grep -oE 'Fedora-Cloud-Base-Generic-Rawhide-[0-9a-zA-Z.-]+\.x86_64\.qcow2' | \
+		sort -V | tail -n 1)"
+
+	if [ -z "$name" ];then
+		echo "Error: Can't get latest fedora rawhide image"
+		return 1
+	fi
+
+	rm -f $IMAGE_ROOT/src_images/Fedora-Cloud-Base-Generic-Rawhide.qcow2
+	# _download will help to create $IMAGE_ROOT/src_images/ directory
+	_download "${base}${name}" "$IMAGE_ROOT/src_images/Fedora-Cloud-Base-Generic-Rawhide.qcow2"
+	if [ $? -eq 0 ];then
+		IMAGE_FILE_SRC="$IMAGE_ROOT/src_images/Fedora-Cloud-Base-Generic-Rawhide.qcow2"
+		return 0
+	else
+		return 1
+	fi
+}
+
+# Only support fedora rawhide currently
+download_image()
+{
+	download_fedora_rawhide || _fatal "Fail to download fedora rawhide qcow2"
+}
+
+usage()
+{
+	echo "Usage-1: $0 <-n|--name virt_name> [-c ncpu] [-m memsize] [-s|--image-file file] [--image-root path] [-T|--template name] [-L|--log file] [--overwrite] [--console]"
+	echo "Usage-2: $0 <-n|--name virt_name> <-S|--start> [--console]"
+	echo "Usage-3: $0 <-n|--name virt_name> <-d|--destroy>"
+	echo "Usage-4: $0 <-l|--list>"'
+
+General options:
+    -c				The number of vcpus, 4 by default
+    -m				The size of memory, 8192 by default
+    -n|--name			The name of virt, it is necessary!
+    -d|--destroy		Destroy the <name> virtual machine specified by -n option
+    -s|--image-file		local (source) image file, will be copied to be test system
+    --image-root		The root path of libvirt images, /var/lib/libvirt/images by default
+    -S|--start			Start "-n virt_name" which is existed
+    --console			Use current terminal to attach to the console of VM
+    -T|--template		Use a cloud yaml file (as a template) to init the system
+    -L|--log			Log file
+    -l|--list			List all existed VMs
+    -h|--help			usage
+
+examples:
+  $ sudo gmv -n myvirt -s ./my_image_file.qcow2
+  $ sudo gmv -n fedora-xfstests-xfs -s ~/Download/Fedora-rawhide-20260606.qcow2 -T xfstests-xfs
+  $ sudo gmv --image-root /var/lib/libvirt/images/ --image-file ./my_image_file.qcow2
+  $ sudo gmv -d -n fedora-xfstests-xfs
+  $ sudo gmv -L foo/bar.log -n fedora-xfstests-xfs -s ~/Download/Fedora-rawhide-20260606.qcow2 -T xfstests-xfs
+  $ sudo gmv -l
+  $ gmv -h
+'
+	_fatal "$@"
+}
+
+check_args()
+{
+	if [ "$WORK_MODE" != "list" ];then
+		# Miss -n <virt_name> option
+		if [ -z "$VIRT_NAME" ];then
+			usage "Miss virt name, please use -n option!"
+		fi
+	fi
+}
+
+parse_args()
+{
+	local short_opts="c:dlL:m:n:s:ST:h"
+	local long_opts="console,destroy,name:,image-file:,image-root:,list,log:,start,template:,overwrite,help"
+
+	# Note: The '+' prefix in getopt's option string preserves the existing
+	# behavior that option parsing stops at the first non-option test argument.
+	local parsed_opts=$(getopt -n "gmv" -o +"${short_opts}" -l "$long_opts" -- "$@")
+	test $? -ne 0 && usage "getopt fails"
+
+	eval set -- "$parsed_opts"
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-c)
+			CPU_CNT="$2"
+			shift
+			;;
+		-d|--destroy)
+			[ "$WORK_MODE" != "new" ] && \
+				usage "Conflict options: -d, -S or -l"
+			WORK_MODE="destroy"
+			;;
+		-n|--name)
+			VIRT_NAME="$2"
+			shift
+			;;
+		-s|--image-file)
+			IMAGE_FILE_SRC="$2"
+			shift
+			;;
+		--image-root)
+			IMAGE_ROOT="$2"
+			shift
+			;;
+		-m)
+			MEMORY_SIZE="$2"
+			shift
+			;;
+		-S|--start)
+			[ "$WORK_MODE" != "new" ] && \
+				usage "Conflict options: -d, -S or -l"
+			WORK_MODE="boot"
+			;;
+		-T|--template)
+			VIRT_TEMPLATE="$2"
+			shift
+			;;
+		-l|--list)
+			[ "$WORK_MODE" != "new" ] && \
+				usage "Conflict options: -d, -S or -l"
+			WORK_MODE="list"
+			;;
+		-L|--log)
+			VIRT_LOG="$2"
+			shift
+			;;
+		--console)
+			ATTACH_CONSOLE="yes"
+			;;
+		--overwrite)
+			FORCE_OVERWRITE="yes"
+			;;
+		-h|--help)
+			usage
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			usage
+			;;
+		esac
+		shift
+	done
+
+	# Arguments after "--" are all virt-install related
+	if [ $# -gt 0 ]; then
+		VIRT_REMAIN_ARGS=("$@")
+	fi
+
+	check_args
+}
+
+pre_new_virt_name()
+{
+	# If a vm (named $VIRT_NAME) is running, gmv will exit directly, to let
+	# the user decides to destory the running vm (with -d option) or change
+	# the virt name.
+	if [ -n "$VIRT_NAME" ];then
+		IMAGE_DIR="$IMAGE_ROOT/$VIRT_NAME"
+		if _is_virt_running "$VIRT_NAME";then
+			_fatal "$VIRT_NAME is running, please use another virt name, or use gmv -d to cleanup the running virt"
+		elif _is_virt_exist "$VIRT_NAME";then
+			if [ "$FORCE_OVERWRITE" = "yes" ];then
+				_virt_force_cleanup $VIRT_NAME $IMAGE_DIR
+			else
+				_fatal "$VIRT_NAME is existed, please check!"
+			fi
+		fi
+		# Just remove the unknown $IMAGE_DIR now
+		rm -rf $IMAGE_DIR
+		mkdir -p $IMAGE_DIR
+		VIRT_INSTALL_ARGS+=("--name" "$VIRT_NAME")
+	else
+		usage "Need a virt name!"
+	fi
+}
+
+pre_new_virt_rootfs()
+{
+	if [ -z "$IMAGE_FILE_SRC" ];then
+		download_image
+	fi
+
+	if [ -f "$IMAGE_FILE_SRC" ];then
+		local vroot=$IMAGE_ROOT/$VIRT_NAME/rootfs.qcow2
+		rm -f $vroot
+		cp $IMAGE_FILE_SRC $vroot
+		$QEMU_IMG_PROG resize $vroot 20G
+		VIRT_INSTALL_ARGS+=("--disk" "path=$vroot,format=qcow2")
+	else
+		_fatal "Miss an available image file!"
+	fi
+}
+
+create_extra_disks()
+{
+	local name
+	local size
+	local arg
+
+	for arg in "$@"; do
+		name="${arg%%:*}"
+		size="${arg##*:}"
+		rm -f ${IMAGE_ROOT}/$VIRT_NAME/${name}.qcow2
+		_create_virt_img qcow2 "${IMAGE_ROOT}/$VIRT_NAME/${name}.qcow2" "$size" || \
+			_fatal "Can not create ${IMAGE_ROOT}/$VIRT_NAME/${name}.qcow2"
+	done
+}
+
+pre_new_virt_template()
+{
+	if [ ! -f "cloud-template/${VIRT_TEMPLATE}.yaml" ];then
+		echo "Miss cloud-template/${VIRT_TEMPLATE}.yaml !"
+		exit
+	else
+		VIRT_INSTALL_ARGS+=("--cloud-init" "user-data=cloud-template/${VIRT_TEMPLATE}.yaml")
+	fi
+
+	case "$VIRT_TEMPLATE" in
+	xfstests-xfs)
+		create_extra_disks "xfs-test-dev:20G" "xfs-scratch-dev:20G" "xfs-logwrites-dev:10G"
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/xfs-test-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/xfs-scratch-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/xfs-logwrites-dev.qcow2,format=qcow2")
+		;;
+	xfstests-ext4)
+		create_extra_disks "ext4-test-dev:20G" "ext4-scratch-dev:20G" "ext4-logwrites-dev:10G"
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/ext4-test-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/ext4-scratch-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/ext4-logwrites-dev.qcow2,format=qcow2")
+		;;
+	xfstests-btrfs)
+		create_extra_disks "btrfs-test-dev:20G" "btrfs-scratch-devA:20G" "btrfs-scratch-devB:20G" "btrfs-scratch-devC:20G" "btrfs-scratch-devD:20G" "btrfs-logwrites-dev:10G"
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-test-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-scratch-devA.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-scratch-devB.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-scratch-devC.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-scratch-devD.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/btrfs-logwrites-dev.qcow2,format=qcow2")
+		;;
+	*)
+		# default
+		create_extra_disks "test-dev:20G" "scratch-dev:200G"
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/test-dev.qcow2,format=qcow2")
+		VIRT_INSTALL_ARGS+=("--disk" "path=${IMAGE_ROOT}/$VIRT_NAME/scratch-dev.qcow2,format=qcow2")
+		;;
+	esac
+}
+
+pre_new_virt_hardware()
+{
+	VIRT_INSTALL_ARGS+=(--memory ${MEMORY_SIZE})
+	VIRT_INSTALL_ARGS+=(--vcpus ${CPU_CNT})
+}
+
+pre_new_virt_others()
+{
+	if [ -z "$VIRT_LOG" ];then
+		VIRT_LOG=/tmp/${VIRT_NAME}.log
+	fi
+	# Hmm... need a proper way to detect osinfo, maybe virt-inspector.
+	if [ -z "$VIRT_OSINFO" ];then
+		VIRT_OSINFO=generic
+	fi
+
+	VIRT_INSTALL_ARGS+=(--osinfo detect=on,name=$VIRT_OSINFO)
+	VIRT_INSTALL_ARGS+=(--network network=default)
+	VIRT_INSTALL_ARGS+=(--graphics none)
+	VIRT_INSTALL_ARGS+=(--import)
+	# Serial0 for host PTY (virsh console ${VIRT_NAME}\)
+	VIRT_INSTALL_ARGS+=(--serial pty)
+	# Serial1 for kernel dmesg log
+	VIRT_INSTALL_ARGS+=(--serial file,path=${VIRT_LOG}.dmesg)
+	# Serial2 for cloud-init running log (userspace)
+	VIRT_INSTALL_ARGS+=(--serial file,path=${VIRT_LOG}.output)
+	VIRT_INSTALL_ARGS+=(--console pty,target_type=serial)
+
+	if [ "$ATTACH_CONSOLE" != "yes" ];then
+		VIRT_INSTALL_ARGS+=(--noautoconsole)
+	fi
+}
+
+pre_new_vrit()
+{
+	pre_new_virt_name
+	pre_new_virt_rootfs
+	pre_new_virt_hardware
+	pre_new_virt_template
+	pre_new_virt_others
+}
+
+new_virt()
+{
+	echo "Running: $VIRT_INSTALL_PROG ${VIRT_INSTALL_ARGS[*]}"
+	$VIRT_INSTALL_PROG "${VIRT_INSTALL_ARGS[@]}" "${VIRT_REMAIN_ARGS[@]}"
+	echo "Use \'virsh console ${VIRT_NAME}\' to attach the running vm, Ctrl + ] to detach"
+}
+
+boot_virt()
+{
+	if [ "$ATTACH_CONSOLE" != "yes" ];then
+		_virt_start ${VIRT_NAME}
+	else
+		_virt_start ${VIRT_NAME} --console
+	fi
+}
+
+list_virt()
+{
+	_virt_list
+}
+
+destroy_virt()
+{
+	local response
+
+	# The -d option triggers a full VM cleanup regardless of other options.
+	# Keep an interactive confirmation here to prevent accidental data loss.
+	read -p "Dangerous! You're going to cleanup the whole $VIRT_NAME VM, are you sure? [y|[n]]: " response
+	if [[ "${response,,}" =~ ^(y|yes)$ ]]; then
+		echo "Proceeding with $VIRT_NAME cleanup..."
+	else
+		_fatal "$VIRT_NAME cleanup aborted."
+	fi
+	_virt_force_cleanup ${VIRT_NAME} $IMAGE_ROOT/$VIRT_NAME
+}
+
+# main
+_require_root_permission
+_require_progs curl qemu-img virsh virt-install
+
+parse_args "$@"
+
+case "$WORK_MODE" in
+new)
+	pre_new_vrit
+	new_virt
+	;;
+boot)
+	boot_virt
+	;;
+list)
+	list_virt
+	;;
+destroy)
+	destroy_virt
+	;;
+*)
+	_fatal "Unknown $WORK_MODE work mode!"
+	;;
+esac
+
+exit 0
+# virt-install --name fedora-xfstests-xfs \
+#	--osinfo fedora-rawhide \
+#	--memory 8192 --vcpus 4 \
+# 	--disk path=/var/lib/libvirt/images/fedora-rawhide.qcow2,format=qcow2 \
+#	--disk path=/var/lib/libvirt/images/xfstests-disks/xfs-test-dev.qcow2,format=qcow2 \
+#	--disk path=/var/lib/libvirt/images/xfstests-disks/xfs-scratch-dev.qcow2,format=qcow2 \
+#	--disk path=/var/lib/libvirt/images/xfstests-disks/xfs-logwrites-dev.qcow2,format=qcow2 \
+#	--cloud-init user-data=/home/zorro/cloud-init/xfstests-xfs.yaml \
+#	--network network=default \
+#	--graphics none \
+#	--import
+#	--console pty,target_type=serial
+#	--serial file,path=${VIRT_LOG}
+#	--noautoconsole
+
+# 获取虚机 IP 并实时查看纯净的测试输出，绝无 dmesg 干扰
+# ssh root@$(virsh domifaddr <虚机名> | awk '/ipv4/ {print $4}' | cut -d/ -f1) "tail -f /root/pure-xfstests.log"

@@ -1,0 +1,6 @@
+## /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+FEDORA_PUB="https://dl.fedoraproject.org/pub/fedora/linux/"
+FED_RAW_CLOUD_x86="${FEDORA_PUB}development/rawhide/Cloud/x86_64/images/"

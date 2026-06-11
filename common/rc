@@ -1,0 +1,27 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+
+. ./common/config
+
+_log_dmesg()
+{
+	if [ -w /dev/kmsg ]; then
+		echo -e "$@" >/dev/kmsg
+	fi
+}
+
+_is_rpm_ostree()
+{
+	if [ -f /run/ostree-booted ]; then
+		return 0
+	fi
+
+	return 1
+}
+
+_fatal()
+{
+	echo "$*"
+	exit 1
+}
