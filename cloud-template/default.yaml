@@ -1,0 +1,123 @@
+#cloud-config
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2026 Zorro Lang <zlang@kernel.org>. All Rights Reserved.
+hostname: default-test
+
+# The disk name in VM is from vdb to vdf and more
+disk_setup:
+  /dev/vdb: {table_type: 'mbr', layout: true, overwrite: false}
+  /dev/vdc: {table_type: 'mbr', layout: true, overwrite: false}
+
+# We've growed the rootfs qcow2 file to 20G or more, now enable it
+growpart:
+  mode: auto
+  devices: ['/']
+# rootfs resize
+resize_rootfs: true
+
+# Create users for testing
+users:
+  - name: root
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG9rqyj2jgwIWKxJcaHN2FiSsfYCwSZjSUxqfLEIkOi1 zorro@zlang-laptop
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN+YUe1mOrcHijdFrdLzotlfRmCCfCqABWiAzJz5vKZ6 zorro@zlang-server
+  - name: fsgqa
+    gecos: xfstests user 1
+    primary_group: fsgqa
+    groups: [fsgqa]
+    shell: /bin/bash
+  - name: fsgqa2
+    gecos: xfstests user 2
+    primary_group: fsgqa2
+    groups: [fsgqa2]
+    shell: /bin/bash
+  - name: 123456-fsgqa
+    gecos: xfstests numeric user
+    primary_group: 123456-fsgqa
+    groups: [123456-fsgqa]
+    shell: /bin/bash
+
+# Allow the root login with password
+ssh_pwauth: true
+# set root passwork
+chpasswd:
+  list: |
+    root:F*ibm
+  expire: false
+
+write_files:
+  - path: /etc/dnf/dnf.conf
+    append: true
+    content: |
+      minrate=10
+      timeout=120
+      eglobalsist_quiet=1
+      fastestmirror=True
+      max_parallel_downloads=10
+  - path: /etc/sysctl.d/99-ci-kernel-hardening.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      # Force a kernel panic when receiving an unknown NMI (triggered via host
+      # 'virsh inject-nmi') to smash lockups
+      kernel.unknown_nmi_panic = 1
+      kernel.panic_on_io_nmi = 1
+      kernel.panic_on_oops = 1
+
+  # Ephemeral Bridge Service: Stream kernel ring buffer to ttyS1 *only* during the first boot before GRUB takes effect
+  - path: /etc/systemd/system/dmesg-to-serial1.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Stream Kernel Ring Buffer to Serial1 (ttyS1)
+      After=local-fs.target
+      DefaultDependencies=no
+
+      [Service]
+      Type=simple
+      SELinuxContext=system_u:system_r:unconfined_service_t:s0
+      ExecStart=/bin/sh -c "dmesg -w"
+      StandardOutput=file:/dev/ttyS1
+      StandardError=file:/dev/ttyS1
+      Restart=always
+      RestartSec=1s
+
+      [Install]
+      WantedBy=multi-user.target
+
+# Redirect all output to ttyS2 which will be a file of host
+output:
+  all: ">> /dev/ttyS2"
+
+runcmd:
+  # Set kernel printk threshold to maximum (8) to force all debug messages
+  # through the serial console without omission
+  - echo "8 8 8 8" > /proc/sys/kernel/printk
+  - restorecon -v /etc/systemd/system/dmesg-to-serial1.service
+  # Appply above changes for sysctl and systemd
+  - sysctl --system
+  - systemctl mask serial-getty@ttyS1.service
+  - systemctl daemon-reload
+  - systemctl enable --now dmesg-to-serial1
+  - systemctl start dmesg-to-serial1
+
+  # Allow root SSH login with password
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf
+  - [ systemctl, restart, sshd ]
+
+  # - [ systemctl, enable, --now, cockpit.socket ]
+  # build xfstests
+  - dnf -y --nogpgcheck --setopt=strict=0 install acl attr automake bc dbench dump btrfs-progs e2fsprogs e2fsprogs-devel fio gawk gcc gdbm-devel git indent kernel-devel libacl-devel libaio-devel libcap-devel libtool liburing-devel libuuid-devel lvm2 make psmisc python3 quota sed sqlite udftools xfsprogs xfsprogs-devel xfsprogs-xfs_scrub sqlite fsverity-utils kernel-devel indent e2fsprogs xfsdump
+  - |
+    set -e
+    wipefs -a /dev/vdb
+    wipefs -a /dev/vdc
+    cd /root/
+    if [ ! -d "xfstests-dev" ];then
+      git clone https://gitee.com/zrlang/xfstests.git xfstests-dev
+    fi
+    cd xfstests-dev
+    git checkout -b scratch-test origin/scratch-test
+    make -j4
